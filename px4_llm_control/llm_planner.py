@@ -81,6 +81,18 @@ Two additional step types give finer control:
   explicitly asks for a tilt/bank/roll/pitch/thrust maneuver, keep roll/pitch small
   (well under 0.35 rad) and "duration" short (a few seconds) unless told otherwise, since
   the vehicle will drift in position and altitude for the whole duration.
+
+One more step type:
+
+- "follow": visually track and follow a detected object using the onboard camera —
+  "follow the person", "follow that car", "follow the dog". Set "target" to the
+  lowercase COCO class name of the object to follow (e.g. "person", "car", "dog",
+  "cat", "bicycle"); default to "person" for instructions about following a
+  person/them/him/her without naming another object. This step has no duration — the
+  drone keeps following until a new instruction is given. A bare "stop"/"stop
+  following"/"cancel" (with nothing else requested) becomes a single
+  {"action": "hold", "duration": 1} step, which interrupts any in-progress "follow" and
+  leaves the drone holding position.
 """
 
 PLAN_TOOL = {
@@ -97,7 +109,7 @@ PLAN_TOOL = {
                     'properties': {
                         'action': {
                             'type': 'string',
-                            'enum': ['takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'land', 'rtl'],
+                            'enum': ['takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'follow', 'land', 'rtl'],
                         },
                         'altitude': {
                             'type': 'number',
@@ -169,6 +181,10 @@ PLAN_TOOL = {
                             'type': 'number',
                             'description': 'hold / velocity / attitude: seconds',
                         },
+                        'target': {
+                            'type': 'string',
+                            'description': 'follow: lowercase COCO object class to track (e.g. "person", "car", "dog")',
+                        },
                     },
                     'required': ['action'],
                 },
@@ -178,7 +194,7 @@ PLAN_TOOL = {
     },
 }
 
-VALID_ACTIONS = {'takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'land', 'rtl'}
+VALID_ACTIONS = {'takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'follow', 'land', 'rtl'}
 REQUIRED_FIELDS = {
     'takeoff': ('altitude',),
     'goto': ('x', 'y', 'z'),
@@ -186,6 +202,7 @@ REQUIRED_FIELDS = {
     'hold': ('duration',),
     'velocity': ('duration',),
     'attitude': ('roll', 'pitch', 'yaw', 'thrust', 'duration'),
+    'follow': ('target',),
     'land': (),
     'rtl': (),
 }

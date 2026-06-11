@@ -23,9 +23,10 @@ source install/setup.bash
 Running the full system requires three things, in order:
 
 ```bash
-# 1. PX4 SITL
+# 1. PX4 SITL (x500_mono_cam adds a forward camera, used by "follow" steps;
+#    otherwise identical flight dynamics to plain x500)
 cd ~/PX4-Autopilot
-make px4_sitl gz_x500
+make px4_sitl gz_x500_mono_cam
 
 # 2. uXRCE-DDS bridge
 MicroXRCEAgent udp4 -p 8888
@@ -40,6 +41,16 @@ publish `/nl_command` strings and print `/nl_mission/status`. The launch file st
 GUI; run `ros2 run px4_llm_control command_cli` instead/additionally for a terminal interface.
 
 `NL_MISSION_MODEL` overrides the Claude model used by the planner (default `claude-sonnet-4-6`).
+
+For "follow" instructions, also run the vision pipeline (camera bridge + YOLO tracker):
+
+```bash
+# 4. Vision pipeline (camera bridge + ultralytics_ros tracker -> /yolo_result)
+ros2 launch px4_llm_control vision.launch.py
+```
+
+This is optional — without it, "follow" steps just report a lost target after
+`FOLLOW_LOST_TIMEOUT_S` and return to `IDLE`.
 
 ## Testing & linting
 
@@ -70,10 +81,10 @@ message it:
    the 10 Hz offboard heartbeat, so it never runs on the main/tick thread.
 3. The worker calls `LLMPlanner.plan()` (`llm_planner.py`), which forces Claude to call a
    `submit_mission_plan` tool and returns a validated list of step dicts
-   (`action` ∈ `takeoff | goto | move | hold | velocity | attitude | land | rtl`, with NED
-   `x/y/z`, `altitude`, `yaw`, `forward/right/dz/yaw_delta`, `duration`,
-   `vx/vy/vz/forward_speed/right_speed/yawspeed`, or `roll/pitch/thrust` fields as
-   appropriate).
+   (`action` ∈ `takeoff | goto | move | hold | velocity | attitude | follow | land | rtl`,
+   with NED `x/y/z`, `altitude`, `yaw`, `forward/right/dz/yaw_delta`, `duration`,
+   `vx/vy/vz/forward_speed/right_speed/yawspeed`, `roll/pitch/thrust`, or `target`
+   (for `follow`, a lowercase COCO class name) fields as appropriate).
 4. Results are drained back on the main thread (`_drain_plans`) and appended to a
    `deque` of pending steps.
 
@@ -110,6 +121,24 @@ setpoint, then dispatches based on `State`:
   thrust, converted to a quaternion + body thrust by `euler_to_quaternion()`) until
   `_timer_until`, then re-anchors `_hold_x/y/z`/`_hold_yaw` and returns to `IDLE`. This is
   an open-loop maneuver — no position/altitude hold while active.
+- `FOLLOW` — visually servos toward the `target` COCO class (e.g. `"person"`) using the
+  latest `/yolo_result` detections (`_find_follow_target`, nearest-neighbor match to the
+  previous tick's bbox center, since `tracker_node.py` exposes no track ID). Each tick:
+  horizontal pixel offset `err_x` (bbox center vs. image center, normalized to `[-1, 1]`)
+  drives `yawspeed` (`FOLLOW_KP_YAW`), and bbox-height error `err_size` (vs.
+  `FOLLOW_TARGET_BBOX_HEIGHT_FRAC * CAMERA_HEIGHT`) drives `forward_speed`
+  (`FOLLOW_KP_FORWARD`), both clamped (`FOLLOW_MAX_YAWSPEED_RADPS`,
+  `FOLLOW_MAX_SPEED_MPS`) and converted to NED `vx/vy` via the drone's current heading —
+  same `cos`/`sin` pattern as `move`/`velocity`. Altitude (`vz`) is held at 0 (no
+  altitude tracking). `follow` has no duration: it streams indefinitely until either (a)
+  a new instruction queues a step — `_steps` non-empty preempts `FOLLOW`, re-anchoring
+  `_hold_x/y/z`/`_hold_yaw` and returning to `IDLE` so the new step dispatches normally —
+  or (b) the target class isn't seen in `/yolo_result` for more than
+  `FOLLOW_LOST_TIMEOUT_S`, in which case the drone hovers (zero velocity) while waiting,
+  then re-anchors and returns to `IDLE`, reporting "lost" via `/nl_mission/status`. A
+  bare "stop"/"stop following"/"cancel" is planned by the LLM as
+  `{"action": "hold", "duration": 1}`, which is enough to trigger the
+  `_steps`-non-empty preemption.
 - `LAND` / `RTL` — one-shot handoff to PX4's `AUTO_LAND` / `AUTO_RTL`, then move to
   `EXTERNAL_WAIT`.
 - `EXTERNAL_WAIT` — waits for PX4 to disarm after a LAND/RTL, clears any remaining
@@ -155,3 +184,27 @@ needed since north/east/down don't depend on heading).
 - PX4 out (`/fmu/in/...`, BEST_EFFORT/TRANSIENT_LOCAL QoS): `offboard_control_mode`,
   `trajectory_setpoint`, `vehicle_attitude_setpoint`, `vehicle_command`
 - PX4 in (`/fmu/out/...`, same QoS): `vehicle_local_position_v1`, `vehicle_status_v4`
+
+### Vision pipeline ("follow" steps)
+
+`vision.launch.py` (separate from the main launch file, since loading a YOLO model is
+slow) bridges the `x500_mono_cam` SITL model's forward camera
+(Gazebo `/camera/color/image_raw`) into ROS 2 via `ros_gz_image image_bridge`, then runs
+`ultralytics_ros`'s `tracker_node.py` on it, publishing `ultralytics_ros/msg/YoloResult`
+on `/yolo_result`. `mission_executor.py` subscribes to `/yolo_result` unconditionally
+(`_cb_yolo`); if the vision pipeline isn't running, a `follow` step simply never finds
+its target and reports "lost" after `FOLLOW_LOST_TIMEOUT_S` (graceful degradation, not a
+hard dependency).
+
+`CAMERA_WIDTH`/`CAMERA_HEIGHT` (1280×960) in `mission_executor.py` must match the
+camera's `<width>`/`<height>` in
+`Tools/simulation/gz/models/mono_cam/model.sdf` (used by `x500_mono_cam`) — if the
+camera resolution there ever changes, update these constants too, since `_s_follow`'s
+`err_x`/`err_size` normalization assumes them.
+
+`tracker_node.py` does not populate any track-ID field on `Detection2D`, so
+`_find_follow_target` re-identifies "the same" object across ticks heuristically: it
+filters detections to the `target` COCO class, then picks whichever match is nearest
+(by pixel distance) to the previous tick's bbox center (`_follow_last_bbox`), falling
+back to the highest-confidence match when there's no previous bbox (i.e. right after
+`follow` is dispatched).

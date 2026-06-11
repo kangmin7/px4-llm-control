@@ -34,6 +34,7 @@ from px4_msgs.msg import (
     OffboardControlMode, TrajectorySetpoint, VehicleAttitudeSetpoint, VehicleCommand,
     VehicleLocalPosition, VehicleStatus,
 )
+from ultralytics_ros.msg import YoloResult
 
 from px4_llm_control.llm_planner import LLMPlanner, PlannerError
 
@@ -50,6 +51,16 @@ MIN_THRUST         = 0.0
 MAX_THRUST         = 0.9    # leave headroom below full throttle
 MAX_TIMED_STEP_S   = 15.0   # duration clamp for 'hold' / 'velocity' / 'attitude' steps
 EXTERNAL_WAIT_TIMEOUT_S = 10.0  # give up waiting for PX4 to auto-disarm after LAND/RTL
+
+# 'follow' step: visual-servo control law over /yolo_result (ultralytics_ros).
+CAMERA_WIDTH  = 1280   # matches Tools/simulation/gz/models/mono_cam/model.sdf (x500_mono_cam)
+CAMERA_HEIGHT = 960
+FOLLOW_TARGET_BBOX_HEIGHT_FRAC = 0.5   # desired bbox height / image height ("follow distance")
+FOLLOW_KP_YAW             = 1.0   # rad/s yawspeed per unit normalized horizontal error
+FOLLOW_KP_FORWARD         = 2.0   # m/s forward speed per unit normalized size error
+FOLLOW_MAX_SPEED_MPS      = 1.5
+FOLLOW_MAX_YAWSPEED_RADPS = 0.6
+FOLLOW_LOST_TIMEOUT_S     = 3.0   # hover this long after losing the target before giving up
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -78,6 +89,7 @@ class State(Enum):
     HOLD          = auto()   # holding position for a fixed duration
     VELOCITY      = auto()   # commanding an NED velocity (+ optional yaw rate) for a fixed duration
     ATTITUDE      = auto()   # commanding a roll/pitch/yaw + thrust setpoint for a fixed duration
+    FOLLOW        = auto()   # visually tracking a detected object via /yolo_result, until interrupted or lost
     LAND          = auto()   # one-shot: hand off to PX4's AUTO_LAND
     RTL           = auto()   # one-shot: hand off to PX4's AUTO_RTL
     EXTERNAL_WAIT = auto()   # PX4-driven land/RTL in progress — wait for disarm
@@ -110,6 +122,7 @@ class MissionExecutor(Node):
         self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status_v4', self._cb_status, px4_qos)
         self.create_subscription(String, '/nl_command', self._cb_command, 10)
+        self.create_subscription(YoloResult, '/yolo_result', self._cb_yolo, 10)
 
         self._pos    = VehicleLocalPosition()
         self._status = VehicleStatus()
@@ -132,6 +145,13 @@ class MissionExecutor(Node):
         self._attitude_target = (0.0, 0.0, 0.0, 0.0)   # (roll, pitch, yaw, thrust) for ATTITUDE
         self._timer_until = 0.0                      # clock seconds for HOLD / VELOCITY / ATTITUDE / EXTERNAL_WAIT
 
+        # 'follow' state
+        self._latest_detections = []      # most recent vision_msgs/Detection2D list from /yolo_result
+        self._follow_target_class = None  # lowercase COCO class name being followed
+        self._follow_last_bbox = None     # (x, y) pixel center of the previously-locked detection
+        self._follow_lost_since = None    # wall clock when the target was last seen, or None
+        self._follow_locked = False       # whether we've reported "tracking" since FOLLOW started
+
         # The LLM call blocks on the network — run it on a worker thread so the
         # 10 Hz offboard heartbeat (required to stay in OFFBOARD mode) never stalls.
         self._planner  = LLMPlanner()
@@ -153,6 +173,9 @@ class MissionExecutor(Node):
             self._status_msg(f'PX4: arming_state={msg.arming_state}, nav_state={msg.nav_state}')
             self._last_arming_state = msg.arming_state
             self._last_nav_state    = msg.nav_state
+
+    def _cb_yolo(self, msg: YoloResult):
+        self._latest_detections = msg.detections.detections
 
     def _cb_command(self, msg: String):
         instruction = msg.data.strip()
@@ -203,8 +226,8 @@ class MissionExecutor(Node):
 
     def _send_ocm(self):
         msg = OffboardControlMode()
-        msg.position  = self._state not in (State.VELOCITY, State.ATTITUDE)
-        msg.velocity  = self._state == State.VELOCITY
+        msg.position  = self._state not in (State.VELOCITY, State.ATTITUDE, State.FOLLOW)
+        msg.velocity  = self._state in (State.VELOCITY, State.FOLLOW)
         msg.attitude  = self._state == State.ATTITUDE
         msg.timestamp = self._ts()
         self._pub_ocm.publish(msg)
@@ -284,6 +307,7 @@ class MissionExecutor(Node):
         elif self._state == State.HOLD:          self._s_hold()
         elif self._state == State.VELOCITY:      self._s_velocity()
         elif self._state == State.ATTITUDE:      self._s_attitude()
+        elif self._state == State.FOLLOW:        self._s_follow()
         elif self._state == State.LAND:          self._s_land()
         elif self._state == State.RTL:           self._s_rtl()
         elif self._state == State.EXTERNAL_WAIT: self._s_external_wait()
@@ -365,6 +389,12 @@ class MissionExecutor(Node):
             )
             self._timer_until = self._now_s() + _clamp(float(step['duration']), 0.0, MAX_TIMED_STEP_S)
             self._transition(State.ATTITUDE)
+        elif action == 'follow':
+            self._follow_target_class = step['target'].strip().lower()
+            self._follow_last_bbox = None
+            self._follow_lost_since = None
+            self._follow_locked = False
+            self._transition(State.FOLLOW)
         elif action == 'land':
             self._transition(State.LAND)
         elif action == 'rtl':
@@ -412,6 +442,61 @@ class MissionExecutor(Node):
             self._hold_yaw = self._pos.heading
             self._status_msg('attitude segment complete')
             self._transition(State.IDLE)
+
+    def _find_follow_target(self):
+        matches = [
+            d for d in self._latest_detections
+            if d.results and d.results[0].hypothesis.class_id.lower() == self._follow_target_class
+        ]
+        if not matches:
+            return None
+        if self._follow_last_bbox is not None:
+            lx, ly = self._follow_last_bbox
+            return min(
+                matches,
+                key=lambda d: (d.bbox.center.position.x - lx) ** 2
+                             + (d.bbox.center.position.y - ly) ** 2,
+            )
+        return max(matches, key=lambda d: d.results[0].hypothesis.score)
+
+    def _s_follow(self):
+        # Yield to any newly queued instruction (e.g. "stop", "land", a new "follow ...").
+        if self._steps:
+            self._hold_x, self._hold_y, self._hold_z = self._pos.x, self._pos.y, self._pos.z
+            self._hold_yaw = self._pos.heading
+            self._transition(State.IDLE)
+            return
+
+        target = self._find_follow_target()
+        if target is None:
+            self._send_velocity_setpoint(0.0, 0.0, 0.0, yawspeed=0.0)
+            if self._follow_lost_since is None:
+                self._follow_lost_since = self._now_s()
+            elif self._now_s() - self._follow_lost_since > FOLLOW_LOST_TIMEOUT_S:
+                self._hold_x, self._hold_y, self._hold_z = self._pos.x, self._pos.y, self._pos.z
+                self._hold_yaw = self._pos.heading
+                self._status_msg(f'follow: lost "{self._follow_target_class}" — holding position')
+                self._transition(State.IDLE)
+            return
+
+        if not self._follow_locked:
+            self._follow_locked = True
+            self._status_msg(f'follow: tracking "{self._follow_target_class}"')
+        self._follow_lost_since = None
+
+        cx, cy = target.bbox.center.position.x, target.bbox.center.position.y
+        self._follow_last_bbox = (cx, cy)
+
+        err_x    = (cx - CAMERA_WIDTH / 2) / (CAMERA_WIDTH / 2)
+        err_size = (FOLLOW_TARGET_BBOX_HEIGHT_FRAC * CAMERA_HEIGHT - target.bbox.size_y) / CAMERA_HEIGHT
+
+        yawspeed      = _clamp(FOLLOW_KP_YAW * err_x, -FOLLOW_MAX_YAWSPEED_RADPS, FOLLOW_MAX_YAWSPEED_RADPS)
+        forward_speed = _clamp(FOLLOW_KP_FORWARD * err_size, -FOLLOW_MAX_SPEED_MPS, FOLLOW_MAX_SPEED_MPS)
+
+        heading = self._pos.heading
+        vx = forward_speed * math.cos(heading)
+        vy = forward_speed * math.sin(heading)
+        self._send_velocity_setpoint(vx, vy, 0.0, yawspeed=yawspeed)
 
     def _s_land(self):
         self._send_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)

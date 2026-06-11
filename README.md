@@ -10,7 +10,7 @@ A ROS 2 package that lets you control a PX4 multicopter in natural language. Typ
 **1. PX4 SITL:**
 ```bash
 cd ~/PX4-Autopilot
-make px4_sitl gz_x500
+make px4_sitl gz_x500_mono_cam
 ```
 
 **2. DDS bridge:**
@@ -24,11 +24,19 @@ export ANTHROPIC_API_KEY=your_api_key_here
 ros2 launch px4_llm_control px4_llm_control.launch.py
 ```
 
+**4. Vision pipeline (for "follow" commands):**
+```bash
+ros2 launch px4_llm_control vision.launch.py
+```
+Bridges the vehicle's forward camera into ROS 2 and runs YOLO object tracking on
+it (first run downloads `yolov8n.pt`, needs internet).
+
 ## Example instructions
 
 ```
 take off to 5 metres
 go forward 5 m/s for 5 seconds
 turn right 90 degrees then go backward 10 metres
+follow the person
 return to home
 ```
