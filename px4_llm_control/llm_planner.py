@@ -5,6 +5,7 @@ Requires `pip install anthropic` and an ANTHROPIC_API_KEY in the environment.
 Uses Claude's tool-use to force a schema-validated mission plan as output.
 """
 
+import base64
 import math
 import os
 
@@ -93,6 +94,13 @@ One more step type:
   following"/"cancel" (with nothing else requested) becomes a single
   {"action": "hold", "duration": 1} step, which interrupts any in-progress "follow" and
   leaves the drone holding position.
+  If the instruction further describes WHICH instance of "target" to follow when
+  there could be more than one (e.g. "follow the person in the green shirt", "follow
+  the red car", "follow the small dog"), set "description" to that distinguishing
+  phrase verbatim (e.g. "wearing a green shirt", "the red one", "the small dog") so
+  the executor can visually pick out that specific instance. Omit "description" (or
+  leave it empty) for plain "follow the person"/"follow the car" with nothing
+  distinguishing one instance from another.
 """
 
 PLAN_TOOL = {
@@ -185,6 +193,15 @@ PLAN_TOOL = {
                             'type': 'string',
                             'description': 'follow: lowercase COCO object class to track (e.g. "person", "car", "dog")',
                         },
+                        'description': {
+                            'type': 'string',
+                            'description': (
+                                'follow: optional free-text phrase distinguishing which instance of '
+                                '"target" to follow when there could be more than one '
+                                '(e.g. "wearing a green shirt", "the red one"); omit if the '
+                                'instruction does not single one out'
+                            ),
+                        },
                     },
                     'required': ['action'],
                 },
@@ -242,6 +259,38 @@ class LLMPlanner:
         )
         return self._parse(response)
 
+    def identify_target(self, image_jpeg: bytes, description: str, num_candidates: int):
+        """Pick which numbered candidate in `image_jpeg` matches `description`.
+
+        `image_jpeg` is a JPEG-encoded camera frame with `num_candidates` bounding
+        boxes drawn on it, numbered 1..num_candidates. Returns the chosen 1-based
+        index, or None if no candidate matches `description`.
+        """
+        image_b64 = base64.b64encode(image_jpeg).decode('ascii')
+        prompt = (
+            f'This image has {num_candidates} numbered bounding box(es) drawn on it, '
+            f'each around one candidate object. Which numbered box best matches this '
+            f'description: "{description}"? Reply with ONLY the number, or "none" if '
+            f'none of them match.'
+        )
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=8,
+            messages=[{
+                'role': 'user',
+                'content': [
+                    {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': image_b64}},
+                    {'type': 'text', 'text': prompt},
+                ],
+            }],
+        )
+        text = ''.join(b.text for b in response.content if b.type == 'text')
+        digits = ''.join(c for c in text if c.isdigit())
+        if not digits:
+            return None
+        index = int(digits)
+        return index if 1 <= index <= num_candidates else None
+
     @staticmethod
     def _parse(response) -> list:
         tool_use = next(
@@ -270,5 +319,7 @@ class LLMPlanner:
                 for f in VELOCITY_FIELDS:
                     step.setdefault(f, 0.0)
                 step.setdefault('yawspeed', None)
+            elif action == 'follow':
+                step['description'] = (step.get('description') or '').strip() or None
 
         return steps

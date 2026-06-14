@@ -83,8 +83,10 @@ message it:
    `submit_mission_plan` tool and returns a validated list of step dicts
    (`action` ∈ `takeoff | goto | move | hold | velocity | attitude | follow | land | rtl`,
    with NED `x/y/z`, `altitude`, `yaw`, `forward/right/dz/yaw_delta`, `duration`,
-   `vx/vy/vz/forward_speed/right_speed/yawspeed`, `roll/pitch/thrust`, or `target`
-   (for `follow`, a lowercase COCO class name) fields as appropriate).
+   `vx/vy/vz/forward_speed/right_speed/yawspeed`, `roll/pitch/thrust`, or `target`/
+   `description` (for `follow`, a lowercase COCO class name plus an optional free-text
+   phrase distinguishing which instance, e.g. "wearing a green shirt") fields as
+   appropriate).
 4. Results are drained back on the main thread (`_drain_plans`) and appended to a
    `deque` of pending steps.
 
@@ -130,7 +132,19 @@ setpoint, then dispatches based on `State`:
   (`FOLLOW_KP_FORWARD`), both clamped (`FOLLOW_MAX_YAWSPEED_RADPS`,
   `FOLLOW_MAX_SPEED_MPS`) and converted to NED `vx/vy` via the drone's current heading —
   same `cos`/`sin` pattern as `move`/`velocity`. Altitude (`vz`) is held at 0 (no
-  altitude tracking). `follow` has no duration: it streams indefinitely until either (a)
+  altitude tracking). If the step has a `description` (e.g. "wearing a green shirt"),
+  `_request_target_identification` periodically (`FOLLOW_REIDENTIFY_INTERVAL_S`, and
+  immediately on dispatch) draws numbered boxes around every `target`-class detection on
+  the latest `/camera/color/image_raw` frame and sends it to `LLMPlanner.identify_target`
+  on a background **vision worker thread** (Claude vision, non-blocking — same
+  blocks-on-network/never-on-tick-thread reasoning as the planner thread). The result is
+  drained on the main thread (`_drain_vision`, called every tick) and, if Claude picks a
+  box, that detection's pixel center becomes the new `_follow_last_bbox` — re-seeding
+  `_find_follow_target`'s nearest-neighbor lock onto that instance for subsequent ticks.
+  A "none of these match" or error response leaves `_follow_last_bbox` unchanged (keeps
+  tracking whatever was already locked rather than flapping on one bad frame). Without a
+  `description`, `_find_follow_target` behaves as before (highest-confidence match when
+  nothing is locked yet). `follow` has no duration: it streams indefinitely until either (a)
   a new instruction queues a step — `_steps` non-empty preempts `FOLLOW`, re-anchoring
   `_hold_x/y/z`/`_hold_yaw` and returning to `IDLE` so the new step dispatches normally —
   or (b) the target class isn't seen in `/yolo_result` for more than
@@ -208,3 +222,24 @@ filters detections to the `target` COCO class, then picks whichever match is nea
 (by pixel distance) to the previous tick's bbox center (`_follow_last_bbox`), falling
 back to the highest-confidence match when there's no previous bbox (i.e. right after
 `follow` is dispatched).
+
+### Claude-vision target selection (`follow` steps with a `description`)
+
+When a `follow` step has a `description` (e.g. "follow the person wearing a green
+shirt"), `mission_executor.py` also subscribes to `/camera/color/image_raw`
+(`_cb_image`, via `cv_bridge`) and keeps the latest frame as `_latest_frame`.
+`_request_target_identification` draws a numbered green box (`cv2.rectangle` +
+`cv2.putText`) around every current `target`-class detection, JPEG-encodes the
+annotated frame, and hands it off to a background **vision worker thread**
+(`_vision_worker`) along with `description` and the list of candidate bbox centers —
+this is the same blocks-on-network/never-on-tick-thread pattern as the planner
+thread, since `LLMPlanner.identify_target` makes a Claude vision API call.
+
+`identify_target` sends the annotated image plus a prompt asking which numbered box
+matches `description`, and parses the reply for a 1-based index (or `None` for
+"none"/unparseable). `_drain_vision` (called every tick) maps a returned index back
+to that candidate's *captured* bbox center and sets `_follow_last_bbox` to it,
+re-seeding `_find_follow_target`'s nearest-neighbor lock for subsequent ticks at full
+10 Hz — Claude is only used for periodic re-identification
+(`FOLLOW_REIDENTIFY_INTERVAL_S`, plus once immediately on dispatch), not per-tick
+control.

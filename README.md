@@ -38,5 +38,11 @@ take off to 5 metres
 go forward 5 m/s for 5 seconds
 turn right 90 degrees then go backward 10 metres
 follow the person
+follow the person wearing a green shirt
 return to home
 ```
+
+When an instruction names a specific instance ("the person wearing a green shirt",
+"the red car"), the executor periodically sends the camera frame to Claude's vision
+API to pick out that instance among multiple detections of the same class — see
+`CLAUDE.md` for details.

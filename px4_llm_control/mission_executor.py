@@ -23,12 +23,15 @@ from collections import deque
 from enum import Enum, auto
 from queue import Empty, Queue
 
+import cv2
 import rclpy
+from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import (
-    QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy,
+    QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy, qos_profile_sensor_data,
 )
 
+from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from px4_msgs.msg import (
     OffboardControlMode, TrajectorySetpoint, VehicleAttitudeSetpoint, VehicleCommand,
@@ -61,6 +64,7 @@ FOLLOW_KP_FORWARD         = 2.0   # m/s forward speed per unit normalized size e
 FOLLOW_MAX_SPEED_MPS      = 1.5
 FOLLOW_MAX_YAWSPEED_RADPS = 0.6
 FOLLOW_LOST_TIMEOUT_S     = 3.0   # hover this long after losing the target before giving up
+FOLLOW_REIDENTIFY_INTERVAL_S = 5.0   # how often to re-run Claude-vision target selection
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -114,15 +118,17 @@ class MissionExecutor(Node):
         self._pub_cmd = self.create_publisher(
             VehicleCommand, '/fmu/in/vehicle_command', px4_qos)
         self._pub_att = self.create_publisher(
-            VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint', px4_qos)
+            VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint_v1', px4_qos)
         self._pub_status = self.create_publisher(String, '/nl_mission/status', 10)
 
         self.create_subscription(
             VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1', self._cb_pos, px4_qos)
         self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status_v4', self._cb_status, px4_qos)
+            VehicleStatus, '/fmu/out/vehicle_status_v1', self._cb_status, px4_qos)
         self.create_subscription(String, '/nl_command', self._cb_command, 10)
         self.create_subscription(YoloResult, '/yolo_result', self._cb_yolo, 10)
+        self.create_subscription(
+            Image, '/camera/color/image_raw', self._cb_image, qos_profile_sensor_data)
 
         self._pos    = VehicleLocalPosition()
         self._status = VehicleStatus()
@@ -146,11 +152,16 @@ class MissionExecutor(Node):
         self._timer_until = 0.0                      # clock seconds for HOLD / VELOCITY / ATTITUDE / EXTERNAL_WAIT
 
         # 'follow' state
+        self._cv_bridge = CvBridge()
+        self._latest_frame = None         # most recent /camera/color/image_raw frame (BGR numpy array)
         self._latest_detections = []      # most recent vision_msgs/Detection2D list from /yolo_result
         self._follow_target_class = None  # lowercase COCO class name being followed
+        self._follow_description = None   # optional free-text description for Claude-vision target selection
         self._follow_last_bbox = None     # (x, y) pixel center of the previously-locked detection
         self._follow_lost_since = None    # wall clock when the target was last seen, or None
         self._follow_locked = False       # whether we've reported "tracking" since FOLLOW started
+        self._follow_vision_pending = False    # whether a Claude-vision identification request is in flight
+        self._follow_last_vision_time = None   # wall clock of the last vision identification request
 
         # The LLM call blocks on the network — run it on a worker thread so the
         # 10 Hz offboard heartbeat (required to stay in OFFBOARD mode) never stalls.
@@ -158,6 +169,12 @@ class MissionExecutor(Node):
         self._plan_in  = Queue()   # (instruction, state-snapshot) → worker thread
         self._plan_out = Queue()   # ('ok'|'error', instruction, payload) → tick thread
         threading.Thread(target=self._planner_worker, daemon=True).start()
+
+        # Claude-vision target selection for "follow ... <description>" — also blocks
+        # on the network, so it gets its own worker thread.
+        self._vision_in  = Queue()   # (jpeg_bytes, description, candidate_centers) → worker thread
+        self._vision_out = Queue()   # ('ok'|'error', payload, candidate_centers, description) → tick thread
+        threading.Thread(target=self._vision_worker, daemon=True).start()
 
         self.create_timer(1.0 / TICK_HZ, self._tick)
         self.get_logger().info('nl_mission_executor ready — send instructions on /nl_command')
@@ -176,6 +193,9 @@ class MissionExecutor(Node):
 
     def _cb_yolo(self, msg: YoloResult):
         self._latest_detections = msg.detections.detections
+
+    def _cb_image(self, msg: Image):
+        self._latest_frame = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
     def _cb_command(self, msg: String):
         instruction = msg.data.strip()
@@ -212,6 +232,35 @@ class MissionExecutor(Node):
             else:
                 self._status_msg(f'planning failed for "{instruction}": {payload}')
 
+    # ── vision worker thread ─────────────────────────────────────────────────
+
+    def _vision_worker(self):
+        while True:
+            jpeg_bytes, description, candidate_centers = self._vision_in.get()
+            try:
+                index = self._planner.identify_target(jpeg_bytes, description, len(candidate_centers))
+                self._vision_out.put(('ok', index, candidate_centers, description))
+            except Exception as exc:   # noqa: BLE001 — surface SDK/network errors too
+                self._vision_out.put(('error', str(exc), candidate_centers, description))
+
+    def _drain_vision(self):
+        while True:
+            try:
+                kind, payload, candidate_centers, description = self._vision_out.get_nowait()
+            except Empty:
+                return
+            self._follow_vision_pending = False
+            if kind == 'ok':
+                if payload is not None and 1 <= payload <= len(candidate_centers):
+                    self._follow_last_bbox = candidate_centers[payload - 1]
+                    self._status_msg(
+                        f'follow: vision matched "{description}" to candidate {payload}/{len(candidate_centers)}')
+                else:
+                    self._status_msg(
+                        f'follow: vision found no candidate matching "{description}" — keeping current target')
+            else:
+                self._status_msg(f'follow: vision identification error: {payload}')
+
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _now_s(self) -> float:
@@ -226,7 +275,7 @@ class MissionExecutor(Node):
 
     def _send_ocm(self):
         msg = OffboardControlMode()
-        msg.position  = self._state not in (State.VELOCITY, State.ATTITUDE, State.FOLLOW)
+        msg.position  = self._state not in (State.VELOCITY, State.ATTITUDE)
         msg.velocity  = self._state in (State.VELOCITY, State.FOLLOW)
         msg.attitude  = self._state == State.ATTITUDE
         msg.timestamp = self._ts()
@@ -239,11 +288,16 @@ class MissionExecutor(Node):
         msg.timestamp = self._ts()
         self._pub_tsp.publish(msg)
 
-    def _send_velocity_setpoint(self, vx: float, vy: float, vz: float, yawspeed=None):
+    def _send_velocity_setpoint(self, vx: float, vy: float, vz: float, yawspeed=None, hold_z=None):
+        # hold_z: if given, z is position-held at this altitude (mixed
+        # position/velocity setpoint) instead of velocity-controlled — pure
+        # velocity-mode vz=0 has a small steady-state descent rate on PX4, which
+        # is fine for short timed VELOCITY/move segments but causes FOLLOW (which
+        # runs indefinitely) to slowly sink until it hits the ground.
         msg = TrajectorySetpoint()
         nan = float('nan')
-        msg.position  = [nan, nan, nan]
-        msg.velocity  = [float(vx), float(vy), float(vz)]
+        msg.position  = [nan, nan, nan if hold_z is None else float(hold_z)]
+        msg.velocity  = [float(vx), float(vy), nan if hold_z is not None else float(vz)]
         msg.yaw       = nan
         msg.yawspeed  = nan if yawspeed is None else float(yawspeed)
         msg.timestamp = self._ts()
@@ -298,6 +352,7 @@ class MissionExecutor(Node):
 
     def _tick(self):
         self._drain_plans()
+        self._drain_vision()
         self._send_ocm()
 
         if   self._state == State.GROUNDED:      self._s_grounded()
@@ -391,9 +446,12 @@ class MissionExecutor(Node):
             self._transition(State.ATTITUDE)
         elif action == 'follow':
             self._follow_target_class = step['target'].strip().lower()
+            self._follow_description = step.get('description')
             self._follow_last_bbox = None
             self._follow_lost_since = None
             self._follow_locked = False
+            self._follow_vision_pending = False
+            self._follow_last_vision_time = None
             self._transition(State.FOLLOW)
         elif action == 'land':
             self._transition(State.LAND)
@@ -459,6 +517,39 @@ class MissionExecutor(Node):
             )
         return max(matches, key=lambda d: d.results[0].hypothesis.score)
 
+    def _request_target_identification(self):
+        """Ask Claude vision which detected `_follow_target_class` instance matches
+        `_follow_description`, by drawing numbered boxes on the latest camera frame
+        and sending it off on the vision worker thread (non-blocking)."""
+        if self._latest_frame is None:
+            return
+        candidates = [
+            d for d in self._latest_detections
+            if d.results and d.results[0].hypothesis.class_id.lower() == self._follow_target_class
+        ]
+        if not candidates:
+            return
+
+        frame = self._latest_frame.copy()
+        candidate_centers = []
+        for i, d in enumerate(candidates, start=1):
+            cx, cy = d.bbox.center.position.x, d.bbox.center.position.y
+            sx, sy = d.bbox.size_x, d.bbox.size_y
+            x1, y1 = int(cx - sx / 2), int(cy - sy / 2)
+            x2, y2 = int(cx + sx / 2), int(cy + sy / 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, str(i), (x1, max(20, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            candidate_centers.append((cx, cy))
+
+        ok, jpeg = cv2.imencode('.jpg', frame)
+        if not ok:
+            return
+
+        self._follow_vision_pending = True
+        self._follow_last_vision_time = self._now_s()
+        self._vision_in.put((jpeg.tobytes(), self._follow_description, candidate_centers))
+
     def _s_follow(self):
         # Yield to any newly queued instruction (e.g. "stop", "land", a new "follow ...").
         if self._steps:
@@ -467,9 +558,15 @@ class MissionExecutor(Node):
             self._transition(State.IDLE)
             return
 
+        if self._follow_description and not self._follow_vision_pending and (
+            self._follow_last_vision_time is None
+            or self._now_s() - self._follow_last_vision_time >= FOLLOW_REIDENTIFY_INTERVAL_S
+        ):
+            self._request_target_identification()
+
         target = self._find_follow_target()
         if target is None:
-            self._send_velocity_setpoint(0.0, 0.0, 0.0, yawspeed=0.0)
+            self._send_velocity_setpoint(0.0, 0.0, 0.0, yawspeed=0.0, hold_z=self._hold_z)
             if self._follow_lost_since is None:
                 self._follow_lost_since = self._now_s()
             elif self._now_s() - self._follow_lost_since > FOLLOW_LOST_TIMEOUT_S:
@@ -496,7 +593,7 @@ class MissionExecutor(Node):
         heading = self._pos.heading
         vx = forward_speed * math.cos(heading)
         vy = forward_speed * math.sin(heading)
-        self._send_velocity_setpoint(vx, vy, 0.0, yawspeed=yawspeed)
+        self._send_velocity_setpoint(vx, vy, 0.0, yawspeed=yawspeed, hold_z=self._hold_z)
 
     def _s_land(self):
         self._send_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)

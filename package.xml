@@ -9,6 +9,8 @@
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
   <exec_depend>px4_msgs</exec_depend>
   <exec_depend>ultralytics_ros</exec_depend>
   <exec_depend>launch</exec_depend>
