@@ -58,11 +58,13 @@ EXTERNAL_WAIT_TIMEOUT_S = 10.0  # give up waiting for PX4 to auto-disarm after L
 # 'follow' step: visual-servo control law over /yolo_result (ultralytics_ros).
 CAMERA_WIDTH  = 1280   # matches Tools/simulation/gz/models/mono_cam/model.sdf (x500_mono_cam)
 CAMERA_HEIGHT = 960
-FOLLOW_TARGET_BBOX_HEIGHT_FRAC = 0.5   # desired bbox height / image height ("follow distance")
-FOLLOW_KP_YAW             = 1.0   # rad/s yawspeed per unit normalized horizontal error
+FOLLOW_TARGET_BBOX_HEIGHT_FRAC = 0.25  # desired bbox height / image height ("follow distance") —
+                                       # smaller = stand farther back, giving more margin before
+                                       # the target's apparent angular speed outruns yaw tracking
+FOLLOW_KP_YAW             = 2.0   # rad/s yawspeed per unit normalized horizontal error
 FOLLOW_KP_FORWARD         = 2.0   # m/s forward speed per unit normalized size error
 FOLLOW_MAX_SPEED_MPS      = 1.5
-FOLLOW_MAX_YAWSPEED_RADPS = 0.6
+FOLLOW_MAX_YAWSPEED_RADPS = 1.2
 FOLLOW_LOST_TIMEOUT_S     = 3.0   # hover this long after losing the target before giving up
 FOLLOW_REIDENTIFY_INTERVAL_S = 5.0   # how often to re-run Claude-vision target selection
 
