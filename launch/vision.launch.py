@@ -25,7 +25,8 @@ def generate_launch_description():
             'input_topic': '/camera/color/image_raw',
             'result_topic': '/yolo_result',
             'result_image_topic': '/yolo_image',
-            'yolo_model': 'yolov8n.pt',
+            'yolo_model': 'yolo26n.pt',
+            'classes': [0, 2, 9],  # COCO: person, car, traffic light
             'device': 'cpu',
             'tracker': 'bytetrack.yaml',
         }],
