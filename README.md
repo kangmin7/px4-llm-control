@@ -4,6 +4,7 @@ A ROS 2 package that lets you control a PX4 multicopter in natural language. Typ
 
 **Demo**:
 [![Demo](https://img.youtube.com/vi/uGKmal0OO5M/maxresdefault.jpg)](https://www.youtube.com/watch?v=uGKmal0OO5M)
+[![Demo](https://img.youtube.com/vi/FjsosNNV5VA/maxresdefault.jpg)](https://www.youtube.com/watch?v=FjsosNNV5VA)
 
 ## Running
 
@@ -24,12 +25,10 @@ export ANTHROPIC_API_KEY=your_api_key_here
 ros2 launch px4_llm_control px4_llm_control.launch.py
 ```
 
-**4. Vision pipeline (for "follow" commands):**
+**4. Vision pipeline:**
 ```bash
 ros2 launch px4_llm_control vision.launch.py
 ```
-Bridges the vehicle's forward camera into ROS 2 and runs YOLO object tracking on
-it (first run downloads `yolov8n.pt`, needs internet).
 
 ## Example instructions
 
@@ -37,12 +36,9 @@ it (first run downloads `yolov8n.pt`, needs internet).
 take off to 5 metres
 go forward 5 m/s for 5 seconds
 turn right 90 degrees then go backward 10 metres
-follow the person
-follow the person wearing a green shirt
 return to home
 ```
 
 When an instruction names a specific instance ("the person wearing a green shirt",
 "the red car"), the executor periodically sends the camera frame to Claude's vision
-API to pick out that instance among multiple detections of the same class — see
-`CLAUDE.md` for details.
+API to pick out that instance among multiple detections of the same class.
