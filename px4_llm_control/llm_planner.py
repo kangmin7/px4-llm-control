@@ -101,6 +101,12 @@ One more step type:
   the executor can visually pick out that specific instance. Omit "description" (or
   leave it empty) for plain "follow the person"/"follow the car" with nothing
   distinguishing one instance from another.
+
+- "face": hold position and rotate only to keep the target centered in the camera —
+  "face the person", "look at the green person", "keep facing that car". Like "follow"
+  but the drone does NOT move forward/backward — it only yaws in place. Set "target"
+  to the lowercase COCO class name and optionally "description" to identify a specific
+  instance. Has no duration; runs until a new instruction is given.
 """
 
 PLAN_TOOL = {
@@ -117,7 +123,7 @@ PLAN_TOOL = {
                     'properties': {
                         'action': {
                             'type': 'string',
-                            'enum': ['takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'follow', 'land', 'rtl'],
+                            'enum': ['takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'follow', 'face', 'land', 'rtl'],
                         },
                         'altitude': {
                             'type': 'number',
@@ -211,7 +217,7 @@ PLAN_TOOL = {
     },
 }
 
-VALID_ACTIONS = {'takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'follow', 'land', 'rtl'}
+VALID_ACTIONS = {'takeoff', 'goto', 'move', 'hold', 'velocity', 'attitude', 'follow', 'face', 'land', 'rtl'}
 REQUIRED_FIELDS = {
     'takeoff': ('altitude',),
     'goto': ('x', 'y', 'z'),
@@ -220,6 +226,7 @@ REQUIRED_FIELDS = {
     'velocity': ('duration',),
     'attitude': ('roll', 'pitch', 'yaw', 'thrust', 'duration'),
     'follow': ('target',),
+    'face': ('target',),
     'land': (),
     'rtl': (),
 }

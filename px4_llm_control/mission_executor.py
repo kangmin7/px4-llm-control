@@ -104,6 +104,7 @@ class State(Enum):
     VELOCITY      = auto()   # commanding an NED velocity (+ optional yaw rate) for a fixed duration
     ATTITUDE      = auto()   # commanding a roll/pitch/yaw + thrust setpoint for a fixed duration
     FOLLOW        = auto()   # visually tracking a detected object via /yolo_result, until interrupted or lost
+    FACE          = auto()   # hold position, yaw only to keep target centered (no forward movement)
     LAND          = auto()   # one-shot: hand off to PX4's AUTO_LAND
     RTL           = auto()   # one-shot: hand off to PX4's AUTO_RTL
     EXTERNAL_WAIT = auto()   # PX4-driven land/RTL in progress — wait for disarm
@@ -285,16 +286,17 @@ class MissionExecutor(Node):
 
     def _send_ocm(self):
         msg = OffboardControlMode()
-        msg.position  = self._state not in (State.VELOCITY, State.ATTITUDE)
+        msg.position  = self._state not in (State.VELOCITY, State.ATTITUDE, State.FOLLOW)
         msg.velocity  = self._state in (State.VELOCITY, State.FOLLOW)
         msg.attitude  = self._state == State.ATTITUDE
         msg.timestamp = self._ts()
         self._pub_ocm.publish(msg)
 
-    def _send_setpoint(self, x: float, y: float, z: float, yaw=None):
+    def _send_setpoint(self, x: float, y: float, z: float, yaw=None, yawspeed=None):
         msg = TrajectorySetpoint()
         msg.position  = [float(x), float(y), float(z)]
         msg.yaw       = float('nan') if yaw is None else float(yaw)
+        msg.yawspeed  = float('nan') if yawspeed is None else float(yawspeed)
         msg.timestamp = self._ts()
         self._pub_tsp.publish(msg)
 
@@ -373,6 +375,7 @@ class MissionExecutor(Node):
         elif self._state == State.VELOCITY:      self._s_velocity()
         elif self._state == State.ATTITUDE:      self._s_attitude()
         elif self._state == State.FOLLOW:        self._s_follow()
+        elif self._state == State.FACE:          self._s_face()
         elif self._state == State.LAND:          self._s_land()
         elif self._state == State.RTL:           self._s_rtl()
         elif self._state == State.EXTERNAL_WAIT: self._s_external_wait()
@@ -463,6 +466,15 @@ class MissionExecutor(Node):
             self._follow_vision_pending = False
             self._follow_last_vision_time = None
             self._transition(State.FOLLOW)
+        elif action == 'face':
+            self._follow_target_class = step['target'].strip().lower()
+            self._follow_description = step.get('description')
+            self._follow_last_bbox = None
+            self._follow_lost_since = None
+            self._follow_locked = False
+            self._follow_vision_pending = False
+            self._follow_last_vision_time = None
+            self._transition(State.FACE)
         elif action == 'land':
             self._transition(State.LAND)
         elif action == 'rtl':
@@ -612,6 +624,46 @@ class MissionExecutor(Node):
         vx = forward_speed * math.cos(heading)
         vy = forward_speed * math.sin(heading)
         self._send_velocity_setpoint(vx, vy, 0.0, yawspeed=yawspeed, hold_z=self._hold_z)
+
+    def _s_face(self):
+        if self._steps:
+            self._hold_x, self._hold_y, self._hold_z = self._pos.x, self._pos.y, self._pos.z
+            self._hold_yaw = self._pos.heading
+            self._transition(State.IDLE)
+            return
+
+        if self._follow_description and not self._follow_vision_pending and (
+            self._follow_last_vision_time is None
+            or self._now_s() - self._follow_last_vision_time >= FOLLOW_REIDENTIFY_INTERVAL_S
+        ):
+            self._request_target_identification()
+
+        target = self._find_follow_target()
+        if target is None:
+            self._send_setpoint(self._hold_x, self._hold_y, self._hold_z, yawspeed=0.0)
+            if self._follow_lost_since is None:
+                self._follow_lost_since = self._now_s()
+            elif self._follow_locked and self._now_s() - self._follow_lost_since > FOLLOW_LOST_TIMEOUT_S:
+                self._follow_last_bbox = None
+                self._follow_locked = False
+                self._status_msg(f'face: lost "{self._follow_target_class}" — waiting for it to reappear')
+            return
+
+        if not self._follow_locked:
+            self._follow_locked = True
+            self._status_msg(f'face: tracking "{self._follow_target_class}"')
+        self._follow_lost_since = None
+
+        cx, cy = target.bbox.center.position.x, target.bbox.center.position.y
+        self._follow_last_bbox = (cx, cy)
+
+        err_x = (cx - CAMERA_WIDTH / 2) / (CAMERA_WIDTH / 2)
+        if abs(err_x) < FOLLOW_YAW_DEADBAND:
+            yawspeed = 0.0
+        else:
+            yawspeed = _clamp(FOLLOW_KP_YAW * err_x, -FOLLOW_MAX_YAWSPEED_RADPS, FOLLOW_MAX_YAWSPEED_RADPS)
+
+        self._send_setpoint(self._hold_x, self._hold_y, self._hold_z, yawspeed=yawspeed)
 
     def _s_land(self):
         self._send_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
