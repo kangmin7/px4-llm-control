@@ -27,6 +27,8 @@ def generate_launch_description():
             'result_image_topic': '/yolo_image',
             'yolo_model': 'yolo26n.pt',
             'classes': [0, 2, 9],  # COCO: person, car, traffic light
+            'conf_thres': 0.15,  # lowered from the 0.25 default to catch harder
+                                  # angles (e.g. a car seen from behind)
             'device': 'cpu',
             'tracker': 'bytetrack.yaml',
         }],

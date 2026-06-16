@@ -50,7 +50,8 @@ ros2 launch px4_llm_control vision.launch.py
 ```
 
 This is optional — without it, "follow" steps just report a lost target after
-`FOLLOW_LOST_TIMEOUT_S` and return to `IDLE`.
+`FOLLOW_LOST_TIMEOUT_S` and hover in place (still in `FOLLOW`) until a new instruction
+is given.
 
 ## Testing & linting
 
@@ -144,13 +145,16 @@ setpoint, then dispatches based on `State`:
   A "none of these match" or error response leaves `_follow_last_bbox` unchanged (keeps
   tracking whatever was already locked rather than flapping on one bad frame). Without a
   `description`, `_find_follow_target` behaves as before (highest-confidence match when
-  nothing is locked yet). `follow` has no duration: it streams indefinitely until either (a)
-  a new instruction queues a step — `_steps` non-empty preempts `FOLLOW`, re-anchoring
-  `_hold_x/y/z`/`_hold_yaw` and returning to `IDLE` so the new step dispatches normally —
-  or (b) the target class isn't seen in `/yolo_result` for more than
-  `FOLLOW_LOST_TIMEOUT_S`, in which case the drone hovers (zero velocity) while waiting,
-  then re-anchors and returns to `IDLE`, reporting "lost" via `/nl_mission/status`. A
-  bare "stop"/"stop following"/"cancel" is planned by the LLM as
+  nothing is locked yet). `follow` has no duration and, once started, only ends when a new
+  instruction queues a step — `_steps` non-empty preempts `FOLLOW`, re-anchoring
+  `_hold_x/y/z`/`_hold_yaw` and returning to `IDLE` so the new step dispatches normally. If
+  the target class isn't seen in `/yolo_result` for more than `FOLLOW_LOST_TIMEOUT_S`, the
+  drone hovers (zero velocity, holding `_hold_z`) and drops the lock (`_follow_last_bbox =
+  None`, `_follow_locked = False`, reporting "lost ... waiting for it to reappear" via
+  `/nl_mission/status`) but **stays in `FOLLOW`** — if the target is seen again (even much
+  later), `_find_follow_target` falls back to its highest-confidence match (since
+  `_follow_last_bbox` is `None`) and tracking resumes automatically, reporting "tracking"
+  again. A bare "stop"/"stop following"/"cancel" is planned by the LLM as
   `{"action": "hold", "duration": 1}`, which is enough to trigger the
   `_steps`-non-empty preemption.
 - `LAND` / `RTL` — one-shot handoff to PX4's `AUTO_LAND` / `AUTO_RTL`, then move to
@@ -207,10 +211,10 @@ slow) bridges the `x500_mono_cam` SITL model's forward camera
 `ultralytics_ros`'s `tracker_node.py` on it, publishing `ultralytics_ros/msg/YoloResult`
 on `/yolo_result`. `mission_executor.py` subscribes to `/yolo_result` unconditionally
 (`_cb_yolo`); if the vision pipeline isn't running, a `follow` step simply never finds
-its target and reports "lost" after `FOLLOW_LOST_TIMEOUT_S` (graceful degradation, not a
-hard dependency).
+its target, reports "lost" after `FOLLOW_LOST_TIMEOUT_S`, and hovers indefinitely
+(graceful degradation, not a hard dependency).
 
-`CAMERA_WIDTH`/`CAMERA_HEIGHT` (1280×960) in `mission_executor.py` must match the
+`CAMERA_WIDTH`/`CAMERA_HEIGHT` (640×480) in `mission_executor.py` must match the
 camera's `<width>`/`<height>` in
 `Tools/simulation/gz/models/mono_cam/model.sdf` (used by `x500_mono_cam`) — if the
 camera resolution there ever changes, update these constants too, since `_s_follow`'s

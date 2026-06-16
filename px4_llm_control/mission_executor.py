@@ -56,16 +56,24 @@ MAX_TIMED_STEP_S   = 15.0   # duration clamp for 'hold' / 'velocity' / 'attitude
 EXTERNAL_WAIT_TIMEOUT_S = 10.0  # give up waiting for PX4 to auto-disarm after LAND/RTL
 
 # 'follow' step: visual-servo control law over /yolo_result (ultralytics_ros).
-CAMERA_WIDTH  = 1280   # matches Tools/simulation/gz/models/mono_cam/model.sdf (x500_mono_cam)
-CAMERA_HEIGHT = 960
+CAMERA_WIDTH  = 640    # matches Tools/simulation/gz/models/mono_cam/model.sdf (x500_mono_cam)
+CAMERA_HEIGHT = 480
 FOLLOW_TARGET_BBOX_HEIGHT_FRAC = 0.25  # desired bbox height / image height ("follow distance") —
                                        # smaller = stand farther back, giving more margin before
                                        # the target's apparent angular speed outruns yaw tracking
-FOLLOW_KP_YAW             = 2.0   # rad/s yawspeed per unit normalized horizontal error
-FOLLOW_KP_FORWARD         = 2.0   # m/s forward speed per unit normalized size error
+FOLLOW_KP_YAW             = 1.0   # rad/s yawspeed per unit normalized horizontal error
+FOLLOW_YAW_DEADBAND       = 0.05  # |err_x| below this -> yawspeed = 0 (avoids hunting/overshoot
+                                  # oscillation once the target is roughly centered)
+FOLLOW_KP_FORWARD         = 6.0   # m/s forward speed per unit normalized size error — sized so
+                                  # FOLLOW_KP_FORWARD * FOLLOW_TARGET_BBOX_HEIGHT_FRAC ==
+                                  # FOLLOW_MAX_SPEED_MPS, i.e. full speed is reachable when the
+                                  # target shrinks to ~nothing (far away), not just when it's close
+FOLLOW_FORWARD_DEADBAND  = 0.02  # |err_size| below this -> forward_speed = 0 (avoids
+                                  # forward/back "breathing" from the higher gain above)
 FOLLOW_MAX_SPEED_MPS      = 1.5
-FOLLOW_MAX_YAWSPEED_RADPS = 1.2
-FOLLOW_LOST_TIMEOUT_S     = 3.0   # hover this long after losing the target before giving up
+FOLLOW_MAX_YAWSPEED_RADPS = 0.6
+FOLLOW_LOST_TIMEOUT_S     = 3.0   # hover this long after losing the target before dropping the lock
+                                  # (follow keeps hovering and resumes tracking if the target reappears)
 FOLLOW_REIDENTIFY_INTERVAL_S = 5.0   # how often to re-run Claude-vision target selection
 
 
@@ -571,11 +579,13 @@ class MissionExecutor(Node):
             self._send_velocity_setpoint(0.0, 0.0, 0.0, yawspeed=0.0, hold_z=self._hold_z)
             if self._follow_lost_since is None:
                 self._follow_lost_since = self._now_s()
-            elif self._now_s() - self._follow_lost_since > FOLLOW_LOST_TIMEOUT_S:
-                self._hold_x, self._hold_y, self._hold_z = self._pos.x, self._pos.y, self._pos.z
-                self._hold_yaw = self._pos.heading
-                self._status_msg(f'follow: lost "{self._follow_target_class}" — holding position')
-                self._transition(State.IDLE)
+            elif self._follow_locked and self._now_s() - self._follow_lost_since > FOLLOW_LOST_TIMEOUT_S:
+                # Drop the lock but keep hovering in FOLLOW — if the target reappears,
+                # _find_follow_target falls back to its highest-confidence match (since
+                # _follow_last_bbox is cleared) and tracking resumes automatically.
+                self._follow_last_bbox = None
+                self._follow_locked = False
+                self._status_msg(f'follow: lost "{self._follow_target_class}" — waiting for it to reappear')
             return
 
         if not self._follow_locked:
@@ -589,8 +599,14 @@ class MissionExecutor(Node):
         err_x    = (cx - CAMERA_WIDTH / 2) / (CAMERA_WIDTH / 2)
         err_size = (FOLLOW_TARGET_BBOX_HEIGHT_FRAC * CAMERA_HEIGHT - target.bbox.size_y) / CAMERA_HEIGHT
 
-        yawspeed      = _clamp(FOLLOW_KP_YAW * err_x, -FOLLOW_MAX_YAWSPEED_RADPS, FOLLOW_MAX_YAWSPEED_RADPS)
-        forward_speed = _clamp(FOLLOW_KP_FORWARD * err_size, -FOLLOW_MAX_SPEED_MPS, FOLLOW_MAX_SPEED_MPS)
+        if abs(err_x) < FOLLOW_YAW_DEADBAND:
+            yawspeed = 0.0
+        else:
+            yawspeed = _clamp(FOLLOW_KP_YAW * err_x, -FOLLOW_MAX_YAWSPEED_RADPS, FOLLOW_MAX_YAWSPEED_RADPS)
+        if abs(err_size) < FOLLOW_FORWARD_DEADBAND:
+            forward_speed = 0.0
+        else:
+            forward_speed = _clamp(FOLLOW_KP_FORWARD * err_size, -FOLLOW_MAX_SPEED_MPS, FOLLOW_MAX_SPEED_MPS)
 
         heading = self._pos.heading
         vx = forward_speed * math.cos(heading)
