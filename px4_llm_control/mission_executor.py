@@ -74,7 +74,7 @@ FOLLOW_MAX_SPEED_MPS      = 1.5
 FOLLOW_MAX_YAWSPEED_RADPS = 0.6
 FOLLOW_LOST_TIMEOUT_S     = 3.0   # hover this long after losing the target before dropping the lock
                                   # (follow keeps hovering and resumes tracking if the target reappears)
-FOLLOW_REIDENTIFY_INTERVAL_S = 5.0   # how often to re-run Claude-vision target selection
+FOLLOW_REIDENTIFY_INTERVAL_S = 1.0   # how often to re-run Claude-vision target selection
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
